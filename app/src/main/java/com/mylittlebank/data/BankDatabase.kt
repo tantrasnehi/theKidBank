@@ -13,11 +13,14 @@ import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Transaction
+import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.YearMonth
 import java.util.UUID
+
+internal val BuiltInActivityKeys = setOf("READING", "MATHS", "HOMEWORK", "CHORES", "GOOD_HABITS")
 
 @Entity(tableName = "activity_type")
 data class ActivityTypeEntity(
@@ -89,6 +92,7 @@ interface BankDao {
 
     @Query("SELECT * FROM activity_type WHERE key = :key") suspend fun activity(key: String): ActivityTypeEntity?
     @Query("SELECT COUNT(*) FROM activity_type WHERE title = :title COLLATE NOCASE") suspend fun activityTitleCount(title: String): Int
+    @Query("SELECT COUNT(*) FROM activity_type WHERE title = :title COLLATE NOCASE AND key != :key") suspend fun activityTitleCountExcept(title: String, key: String): Int
     @Query("SELECT * FROM reward_rule WHERE activityKey = :key") suspend fun rule(key: String): RewardRuleEntity?
     @Query("SELECT COALESCE(SUM(pointsDelta), 0) FROM ledger_entry WHERE account = :account") suspend fun balance(account: String): Long
     @Query("SELECT COALESCE(SUM(e.pointsDelta), 0) FROM ledger_entry e JOIN ledger_transaction t ON t.id = e.transactionId WHERE e.account = :account AND t.createdAt < :before") suspend fun balanceAt(account: String, before: Long): Long
@@ -101,6 +105,8 @@ interface BankDao {
     @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertSubmission(entity: ActivitySubmissionEntity)
     @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertActivity(entity: ActivityTypeEntity)
     @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertRule(entity: RewardRuleEntity)
+    @Update suspend fun updateActivityRow(entity: ActivityTypeEntity): Int
+    @Query("DELETE FROM activity_type WHERE key = :key") suspend fun deleteActivityRow(key: String): Int
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putRule(rule: RewardRuleEntity)
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun seedActivities(items: List<ActivityTypeEntity>)
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun seedRules(items: List<RewardRuleEntity>)
@@ -146,6 +152,44 @@ interface BankDao {
         val key = UUID.randomUUID().toString()
         insertActivity(ActivityTypeEntity(key, cleanTitle, emoji.trim().ifBlank { "⭐" }, cleanUnit))
         insertRule(RewardRuleEntity(key, ratePoints, System.currentTimeMillis(), dailyQuantityLimit, dailyPointsLimit))
+    }
+
+    @Transaction
+    suspend fun updateActivityConfiguration(
+        key: String,
+        title: String,
+        emoji: String,
+        unit: String,
+        ratePoints: Long,
+        dailyQuantityLimit: Long?,
+        dailyPointsLimit: Long?
+    ) {
+        val current = activity(key) ?: error("This activity no longer exists.")
+        val cleanTitle = title.trim()
+        val cleanUnit = unit.trim()
+        require(cleanTitle.isNotEmpty()) { "Enter an activity name." }
+        require(cleanTitle.length <= 40) { "Activity names must be 40 characters or fewer." }
+        require(activityTitleCountExcept(cleanTitle, key) == 0) { "An activity with that name already exists." }
+        require(cleanUnit.isNotEmpty()) { "Enter what the activity counts." }
+        require(cleanUnit.length <= 24) { "The activity unit must be 24 characters or fewer." }
+        require(ratePoints > 0) { "Enter a reward greater than zero." }
+        require(dailyQuantityLimit == null || dailyQuantityLimit > 0) { "Daily quantity limits must be greater than zero." }
+        require(dailyPointsLimit == null || dailyPointsLimit > 0) { "Daily points limits must be greater than zero." }
+
+        check(updateActivityRow(current.copy(
+            title = cleanTitle,
+            emoji = emoji.trim().ifBlank { "⭐" },
+            unit = cleanUnit
+        )) == 1) { "This activity could not be updated." }
+        putRule(RewardRuleEntity(key, ratePoints, System.currentTimeMillis(), dailyQuantityLimit, dailyPointsLimit))
+    }
+
+    @Transaction
+    suspend fun deleteCustomActivity(key: String): String {
+        require(key !in BuiltInActivityKeys) { "Default activities cannot be deleted. You can turn them off instead." }
+        val current = activity(key) ?: error("This activity no longer exists.")
+        check(deleteActivityRow(key) == 1) { "This activity could not be deleted." }
+        return current.title
     }
 
     @Transaction

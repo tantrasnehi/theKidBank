@@ -1,5 +1,6 @@
 package com.mylittlebank
 
+import android.animation.ValueAnimator
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -22,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -142,8 +144,18 @@ private fun LittleBankApp(dao: BankDao) {
                                     .onSuccess { message = "$title was added to activities." }
                                     .onFailure { message = it.message ?: "The activity could not be added." }
                             }
-                        }, onToggle = { key, enabled -> scope.launch { dao.setActivityEnabled(key, enabled) } }, onRate = { key, points, quantityLimit, pointsLimit ->
-                            scope.launch { dao.putRule(RewardRuleEntity(key, points, System.currentTimeMillis(), quantityLimit, pointsLimit)) }
+                        }, onToggle = { key, enabled -> scope.launch { dao.setActivityEnabled(key, enabled) } }, onEditActivity = { key, title, emoji, unit, points, quantityLimit, pointsLimit ->
+                            scope.launch {
+                                runCatching { dao.updateActivityConfiguration(key, title, emoji, unit, points, quantityLimit, pointsLimit) }
+                                    .onSuccess { message = "$title was updated." }
+                                    .onFailure { message = it.message ?: "The activity could not be updated." }
+                            }
+                        }, onDeleteActivity = { key ->
+                            scope.launch {
+                                runCatching { dao.deleteCustomActivity(key) }
+                                    .onSuccess { message = "$it was deleted. Past passbook entries are still saved." }
+                                    .onFailure { message = it.message ?: "The activity could not be deleted." }
+                            }
                         }, onName = { newName ->
                             childName = newName.trim(); scope.launch { context.profileDataStore.edit { it[ProfilePreferenceKeys.childName] = childName } }
                         }, onInterestRate = { newRate ->
@@ -333,7 +345,8 @@ private fun ParentScreen(
     activities: List<ActivityWithRule>,
     onAddActivity: (String, String, String, Long, Long?, Long?) -> Unit,
     onToggle: (String, Boolean) -> Unit,
-    onRate: (String, Long, Long?, Long?) -> Unit,
+    onEditActivity: (String, String, String, String, Long, Long?, Long?) -> Unit,
+    onDeleteActivity: (String) -> Unit,
     onName: (String) -> Unit,
     onInterestRate: (Int) -> Unit,
     monthlyInterestPercent: Int,
@@ -341,7 +354,7 @@ private fun ParentScreen(
 ) {
     var name by remember(currentName) { mutableStateOf(currentName) }
     var editKey by remember { mutableStateOf<String?>(null) }
-    var rate by remember { mutableStateOf("") }
+    var deleteKey by remember { mutableStateOf<String?>(null) }
     var addingActivity by remember { mutableStateOf(false) }
     var interestRateText by remember(monthlyInterestPercent) { mutableStateOf(monthlyInterestPercent.toString()) }
     val parsedInterestRate = interestRateText.toIntOrNull()
@@ -371,11 +384,20 @@ private fun ParentScreen(
         item { Button(onClick = { addingActivity = true }, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Default.Add, contentDescription = null); Spacer(Modifier.width(8.dp)); Text("Add activity") } }
         items(activities) { item ->
             Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(16.dp)) {
-                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Switch(item.activity.enabled, onCheckedChange = { onToggle(item.activity.key, it) })
-                    Text("${item.activity.emoji} ${item.activity.title}", modifier = Modifier.weight(1f), fontWeight = FontWeight.SemiBold, color = Ink)
-                    Text("${formatPoints(item.ratePoints)} pts/${item.activity.unit}")
-                    TextButton(onClick = { editKey = item.activity.key; rate = item.ratePoints.toString() }) { Text("Edit") }
+                Column(Modifier.fillMaxWidth().padding(14.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Switch(item.activity.enabled, onCheckedChange = { onToggle(item.activity.key, it) })
+                        Column(Modifier.weight(1f).padding(start = 8.dp)) {
+                            Text("${item.activity.emoji} ${item.activity.title}", fontWeight = FontWeight.SemiBold, color = Ink)
+                            Text("${formatPoints(item.ratePoints)} points per ${item.activity.unit}", fontSize = 13.sp, color = Ink.copy(alpha = .75f))
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = { editKey = item.activity.key }) { Text("Edit") }
+                        if (item.activity.key !in BuiltInActivityKeys) {
+                            TextButton(onClick = { deleteKey = item.activity.key }) { Icon(Icons.Default.Delete, contentDescription = null); Spacer(Modifier.width(4.dp)); Text("Delete") }
+                        }
+                    }
                 }
             }
         }
@@ -411,79 +433,175 @@ private fun ParentScreen(
     }
     editKey?.let { key ->
         val activity = activities.firstOrNull { it.activity.key == key }
+        var title by remember(key) { mutableStateOf(activity?.activity?.title.orEmpty()) }
+        var emoji by remember(key) { mutableStateOf(activity?.activity?.emoji.orEmpty()) }
+        var unit by remember(key) { mutableStateOf(activity?.activity?.unit.orEmpty()) }
+        var rateText by remember(key) { mutableStateOf(activity?.ratePoints?.toString().orEmpty()) }
         var quantityCap by remember(key) { mutableStateOf(activity?.dailyQuantityLimit?.toString().orEmpty()) }
         var pointsCap by remember(key) { mutableStateOf(activity?.dailyPointsLimit?.toString().orEmpty()) }
-        AlertDialog(onDismissRequest = { editKey = null }, title = { Text("Set activity rewards") },
+        val parsedRate = rateText.toLongOrNull()
+        val quantityLimit = quantityCap.toLongOrNull()
+        val pointsLimit = pointsCap.toLongOrNull()
+        val valid = activity != null && title.isNotBlank() && unit.isNotBlank() && (parsedRate ?: 0L) > 0 &&
+            (quantityCap.isBlank() || (quantityLimit ?: 0L) > 0) && (pointsCap.isBlank() || (pointsLimit ?: 0L) > 0)
+        AlertDialog(onDismissRequest = { editKey = null }, title = { Text("Edit activity") },
             text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(rate, { rate = it.filter(Char::isDigit) }, label = { Text("Points per ${activity?.activity?.unit ?: "unit"}") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
+                OutlinedTextField(title, { title = it.take(40) }, label = { Text("Activity name") }, singleLine = true)
+                OutlinedTextField(emoji, { emoji = it }, label = { Text("Emoji") }, singleLine = true)
+                OutlinedTextField(unit, { unit = it.take(24) }, label = { Text("Count each one as (for example, page)") }, singleLine = true)
+                OutlinedTextField(rateText, { rateText = it.filter(Char::isDigit) }, label = { Text("Points per unit") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
                 OutlinedTextField(quantityCap, { quantityCap = it.filter(Char::isDigit) }, label = { Text("Daily quantity limit (optional)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
                 OutlinedTextField(pointsCap, { pointsCap = it.filter(Char::isDigit) }, label = { Text("Daily points limit (optional)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
                 Text("Daily limits reset at local midnight.", fontSize = 12.sp)
             } },
             confirmButton = { Button(onClick = {
-                val parsed = rate.toLongOrNull()
-                if (parsed != null) onRate(key, parsed, quantityCap.toLongOrNull(), pointsCap.toLongOrNull())
+                onEditActivity(key, title.trim(), emoji, unit.trim(), parsedRate ?: 0L, quantityLimit, pointsLimit)
                 editKey = null
-            }, enabled = rate.toLongOrNull() != null) { Text("Save rate") } },
+            }, enabled = valid) { Text("Save activity") } },
             dismissButton = { TextButton(onClick = { editKey = null }) { Text("Cancel") } })
+    }
+    deleteKey?.let { key ->
+        val activity = activities.firstOrNull { it.activity.key == key }
+        AlertDialog(
+            onDismissRequest = { deleteKey = null },
+            title = { Text("Delete activity?") },
+            text = { Text("${activity?.activity?.title ?: "This activity"} will be removed from the activity list. Existing passbook entries and balances will be kept.") },
+            confirmButton = { Button(onClick = { onDeleteActivity(key); deleteKey = null }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB3261E))) { Text("Delete") } },
+            dismissButton = { TextButton(onClick = { deleteKey = null }) { Text("Cancel") } }
+        )
     }
 }
 
+private enum class ConfettiStyle { RAIN, FIREWORKS, POP, SPRAY, DOUBLE_CANNON }
+
 private data class ConfettiPiece(
-    val fromLeft: Boolean,
-    val spread: Float,
+    val originX: Float,
+    val originY: Float,
+    val velocityX: Float,
+    val velocityY: Float,
     val delay: Float,
     val size: Float,
-    val sway: Float,
-    val phase: Float,
     val rotation: Float,
-    val color: Color
+    val color: Color,
+    val shape: Int
 )
+
+private fun createConfettiPieces(style: ConfettiStyle, palette: List<Color>): List<ConfettiPiece> {
+    return List(Random.nextInt(240, 321)) { index ->
+        val fromLeft = index % 2 == 0
+        val originX = if (fromLeft) 0.015f + Random.nextFloat() * 0.06f else 0.925f + Random.nextFloat() * 0.06f
+        val originY: Float
+        val velocityX: Float
+        val velocityY: Float
+        when (style) {
+            ConfettiStyle.RAIN -> {
+                originY = -0.1f - Random.nextFloat() * 0.35f
+                velocityX = if (fromLeft) 0.18f + Random.nextFloat() * 0.42f else -0.18f - Random.nextFloat() * 0.42f
+                velocityY = 0.9f + Random.nextFloat() * 0.45f
+            }
+            ConfettiStyle.FIREWORKS -> {
+                originY = 0.28f + Random.nextFloat() * 0.35f
+                val angle = if (fromLeft) {
+                    (-Math.PI / 2.0 + Random.nextDouble() * Math.PI).toFloat()
+                } else {
+                    (Math.PI / 2.0 + Random.nextDouble() * Math.PI).toFloat()
+                }
+                val speed = 0.45f + Random.nextFloat() * 0.48f
+                velocityX = kotlin.math.cos(angle) * speed
+                velocityY = kotlin.math.sin(angle) * speed
+            }
+            ConfettiStyle.POP -> {
+                originY = 0.42f + Random.nextFloat() * 0.18f
+                val angle = if (fromLeft) {
+                    (-Math.PI / 2.0 + Random.nextDouble() * (Math.PI * 0.82)).toFloat()
+                } else {
+                    (Math.PI / 2.0 + Random.nextDouble() * (Math.PI * 0.82)).toFloat()
+                }
+                val speed = 0.48f + Random.nextFloat() * 0.55f
+                velocityX = kotlin.math.cos(angle) * speed
+                velocityY = kotlin.math.sin(angle) * speed - 0.12f
+            }
+            ConfettiStyle.SPRAY -> {
+                originY = 0.48f + Random.nextFloat() * 0.4f
+                velocityX = if (fromLeft) 0.55f + Random.nextFloat() * 0.42f else -0.55f - Random.nextFloat() * 0.42f
+                velocityY = -0.3f - Random.nextFloat() * 0.72f
+            }
+            ConfettiStyle.DOUBLE_CANNON -> {
+                originY = 0.56f + Random.nextFloat() * 0.34f
+                val spread = Random.nextFloat()
+                velocityX = if (fromLeft) 0.25f + spread * 1.35f else -0.25f - spread * 1.35f
+                velocityY = -0.15f - Random.nextFloat() * 1.05f
+            }
+        }
+        ConfettiPiece(
+            originX = originX,
+            originY = originY,
+            velocityX = velocityX,
+            velocityY = velocityY,
+            delay = Random.nextFloat() * 0.2f,
+            size = 7f + Random.nextFloat() * 14f,
+            rotation = (Random.nextFloat() - 0.5f) * 1440f,
+            color = palette.random(),
+            shape = Random.nextInt(3)
+        )
+    }
+}
 
 @Composable
 private fun ConfettiCelebration(trigger: Int) {
     val progress = remember { Animatable(1f) }
-    val colors = remember { listOf(Color(0xFFFFC857), Color(0xFFFF7799), Color(0xFF51B9F2), Color(0xFF53C995), Color(0xFFAA8BF2)) }
-    val pieces = remember {
-        List(64) { index ->
-            ConfettiPiece(
-                fromLeft = index % 2 == 0,
-                spread = Random.nextFloat(),
-                delay = Random.nextFloat() * 0.18f,
-                size = 5f + Random.nextFloat() * 7f,
-                sway = (Random.nextFloat() - 0.5f) * 0.08f,
-                phase = Random.nextFloat() * 6.28f,
-                rotation = (Random.nextFloat() - 0.5f) * 900f,
-                color = colors.random()
-            )
-        }
-    }
+    val colors = listOf(Color(0xFFFFC857), Color(0xFFFF7799), Color(0xFF51B9F2), Color(0xFF53C995), Color(0xFFAA8BF2), Color(0xFFFF8A4C), Color(0xFF54D7D0))
+    var style by remember { mutableStateOf(ConfettiStyle.RAIN) }
+    var pieces by remember { mutableStateOf(emptyList<ConfettiPiece>()) }
 
     LaunchedEffect(trigger) {
         if (trigger > 0) {
+            style = ConfettiStyle.values().filter { it != style }.random()
+            pieces = createConfettiPieces(style, colors.shuffled().take(Random.nextInt(5, colors.size + 1)))
             progress.snapTo(0f)
-            progress.animateTo(1f, animationSpec = tween(durationMillis = 2600, easing = LinearEasing))
+            if (ValueAnimator.areAnimatorsEnabled()) {
+                progress.animateTo(1f, animationSpec = tween(durationMillis = 3400, easing = LinearEasing))
+            } else {
+                progress.snapTo(1f)
+            }
         }
     }
 
     Canvas(Modifier.fillMaxSize()) {
-        if (trigger == 0 || progress.value >= 1f) return@Canvas
+        if (trigger == 0 || progress.value >= 1f || pieces.isEmpty()) return@Canvas
         pieces.forEachIndexed { index, piece ->
             val fall = ((progress.value - piece.delay) / (1f - piece.delay)).coerceIn(0f, 1f)
-            val startX = if (piece.fromLeft) -piece.size else size.width + piece.size
-            val endX = if (piece.fromLeft) size.width * (0.22f + piece.spread * 0.34f) else size.width * (0.44f + piece.spread * 0.34f)
-            val sway = kotlin.math.sin((fall * 6.28f + piece.phase).toDouble()).toFloat() * size.width * piece.sway
-            val x = startX + (endX - startX) * fall + sway
-            val y = -piece.size * (1f + piece.spread) + fall * (size.height + piece.size * 3f)
-            if (index % 4 == 0) {
-                drawCircle(piece.color, radius = piece.size * 0.48f, center = Offset(x, y))
-            } else {
-                rotate(piece.rotation * fall, pivot = Offset(x, y)) {
-                    drawRect(piece.color, topLeft = Offset(x - piece.size * 0.4f, y - piece.size * 0.8f), size = Size(piece.size * 0.8f, piece.size * 1.6f))
+            val drift = kotlin.math.sin((fall * 8.0 + piece.rotation).toDouble()).toFloat() * 0.012f * size.width
+            val x = piece.originX * size.width + piece.velocityX * size.width * fall + drift
+            val y = piece.originY * size.height + piece.velocityY * size.height * fall + styleGravity(style) * size.height * fall * fall
+            rotate(piece.rotation * fall, pivot = Offset(x, y)) {
+                when (piece.shape) {
+                    0 -> drawCircle(piece.color, radius = piece.size * 0.5f, center = Offset(x, y))
+                    1 -> drawRect(piece.color, topLeft = Offset(x - piece.size * 0.4f, y - piece.size * 0.8f), size = Size(piece.size * 0.8f, piece.size * 1.6f))
+                    else -> {
+                        val star = Path()
+                        for (point in 0 until 10) {
+                            val angle = Math.PI * point / 5.0 - Math.PI / 2.0
+                            val radius = if (point % 2 == 0) piece.size * 0.65f else piece.size * 0.28f
+                            val px = x + kotlin.math.cos(angle).toFloat() * radius
+                            val py = y + kotlin.math.sin(angle).toFloat() * radius
+                            if (point == 0) star.moveTo(px, py) else star.lineTo(px, py)
+                        }
+                        star.close()
+                        drawPath(star, piece.color)
+                    }
                 }
             }
         }
     }
+}
+
+private fun styleGravity(style: ConfettiStyle): Float = when (style) {
+    ConfettiStyle.RAIN -> 0.36f
+    ConfettiStyle.FIREWORKS -> 0.85f
+    ConfettiStyle.POP -> 0.72f
+    ConfettiStyle.SPRAY -> 0.64f
+    ConfettiStyle.DOUBLE_CANNON -> 0.7f
 }
 
 private fun formatPoints(points: Long): String = NumberFormat.getIntegerInstance(Locale.getDefault()).format(points)
