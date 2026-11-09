@@ -85,6 +85,7 @@ interface BankDao {
     fun observePassbook(): Flow<List<PassbookRow>>
 
     @Query("SELECT * FROM activity_type WHERE key = :key") suspend fun activity(key: String): ActivityTypeEntity?
+    @Query("SELECT COUNT(*) FROM activity_type WHERE title = :title COLLATE NOCASE") suspend fun activityTitleCount(title: String): Int
     @Query("SELECT * FROM reward_rule WHERE activityKey = :key") suspend fun rule(key: String): RewardRuleEntity?
     @Query("SELECT COALESCE(SUM(pointsDelta), 0) FROM ledger_entry WHERE account = :account") suspend fun balance(account: String): Long
     @Query("SELECT COALESCE(SUM(pointsDelta), 0) FROM ledger_entry WHERE account = :account AND transactionId IN (SELECT id FROM ledger_transaction WHERE kind = 'REWARD') AND transactionId IN (SELECT transactionId FROM activity_submission WHERE activityKey = :key AND submittedAt >= :start AND submittedAt < :end)") suspend fun dailyReward(account: String, key: String, start: Long, end: Long): Long
@@ -93,6 +94,8 @@ interface BankDao {
     @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertTransaction(entity: LedgerTransactionEntity)
     @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertEntries(entities: List<LedgerEntryEntity>)
     @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertSubmission(entity: ActivitySubmissionEntity)
+    @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertActivity(entity: ActivityTypeEntity)
+    @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertRule(entity: RewardRuleEntity)
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putRule(rule: RewardRuleEntity)
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun seedActivities(items: List<ActivityTypeEntity>)
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun seedRules(items: List<RewardRuleEntity>)
@@ -113,6 +116,31 @@ interface BankDao {
             RewardRuleEntity("CHORES", 10, System.currentTimeMillis()),
             RewardRuleEntity("GOOD_HABITS", 5, System.currentTimeMillis())
         ))
+    }
+
+    @Transaction
+    suspend fun addActivity(
+        title: String,
+        emoji: String,
+        unit: String,
+        ratePoints: Long,
+        dailyQuantityLimit: Long?,
+        dailyPointsLimit: Long?
+    ) {
+        val cleanTitle = title.trim()
+        val cleanUnit = unit.trim()
+        require(cleanTitle.isNotEmpty()) { "Enter an activity name." }
+        require(cleanTitle.length <= 40) { "Activity names must be 40 characters or fewer." }
+        require(activityTitleCount(cleanTitle) == 0) { "An activity with that name already exists." }
+        require(cleanUnit.isNotEmpty()) { "Enter what the activity counts." }
+        require(cleanUnit.length <= 24) { "The activity unit must be 24 characters or fewer." }
+        require(ratePoints > 0) { "Enter a reward greater than zero." }
+        require(dailyQuantityLimit == null || dailyQuantityLimit > 0) { "Daily quantity limits must be greater than zero." }
+        require(dailyPointsLimit == null || dailyPointsLimit > 0) { "Daily points limits must be greater than zero." }
+
+        val key = UUID.randomUUID().toString()
+        insertActivity(ActivityTypeEntity(key, cleanTitle, emoji.trim().ifBlank { "⭐" }, cleanUnit))
+        insertRule(RewardRuleEntity(key, ratePoints, System.currentTimeMillis(), dailyQuantityLimit, dailyPointsLimit))
     }
 
     @Transaction

@@ -129,7 +129,13 @@ private fun LittleBankApp(dao: BankDao) {
                             }
                         })
                         "Learn" -> LearnScreen()
-                        else -> ParentScreen(activities, onToggle = { key, enabled -> scope.launch { dao.setActivityEnabled(key, enabled) } }, onRate = { key, points, quantityLimit, pointsLimit ->
+                        else -> ParentScreen(activities, onAddActivity = { title, emoji, unit, points, quantityLimit, pointsLimit ->
+                            scope.launch {
+                                runCatching { dao.addActivity(title, emoji, unit, points, quantityLimit, pointsLimit) }
+                                    .onSuccess { message = "$title was added to activities." }
+                                    .onFailure { message = it.message ?: "The activity could not be added." }
+                            }
+                        }, onToggle = { key, enabled -> scope.launch { dao.setActivityEnabled(key, enabled) } }, onRate = { key, points, quantityLimit, pointsLimit ->
                             scope.launch { dao.putRule(RewardRuleEntity(key, points, System.currentTimeMillis(), quantityLimit, pointsLimit)) }
                         }, onName = { newName ->
                             childName = newName.trim(); scope.launch { context.dataStore.edit { it[ChildNameKey] = childName } }
@@ -300,14 +306,23 @@ private fun LearnScreen() {
 }
 
 @Composable
-private fun ParentScreen(activities: List<ActivityWithRule>, onToggle: (String, Boolean) -> Unit, onRate: (String, Long, Long?, Long?) -> Unit, onName: (String) -> Unit, currentName: String) {
+private fun ParentScreen(
+    activities: List<ActivityWithRule>,
+    onAddActivity: (String, String, String, Long, Long?, Long?) -> Unit,
+    onToggle: (String, Boolean) -> Unit,
+    onRate: (String, Long, Long?, Long?) -> Unit,
+    onName: (String) -> Unit,
+    currentName: String
+) {
     var name by remember(currentName) { mutableStateOf(currentName) }
     var editKey by remember { mutableStateOf<String?>(null) }
     var rate by remember { mutableStateOf("") }
+    var addingActivity by remember { mutableStateOf(false) }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { Text("Grown-up corner", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Ink) }
-        item { Text("Set the points for each activity. Changes apply to future activities.", color = Ink) }
+        item { Text("Choose activities and set their rewards. Changes apply to future activities.", color = Ink) }
         item { OutlinedTextField(name, { name = it }, label = { Text("Child's name") }, trailingIcon = { TextButton(onClick = { if (name.isNotBlank()) onName(name) }) { Text("Save") } }, singleLine = true) }
+        item { Button(onClick = { addingActivity = true }, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Default.Add, contentDescription = null); Spacer(Modifier.width(8.dp)); Text("Add activity") } }
         items(activities) { item ->
             Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(16.dp)) {
                 Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -319,6 +334,34 @@ private fun ParentScreen(activities: List<ActivityWithRule>, onToggle: (String, 
             }
         }
         item { Text("PIN protection is turned off for this first version.", fontSize = 13.sp, color = Ink.copy(alpha = .65f)) }
+    }
+    if (addingActivity) {
+        var title by remember { mutableStateOf("") }
+        var emoji by remember { mutableStateOf("⭐") }
+        var unit by remember { mutableStateOf("") }
+        var newRate by remember { mutableStateOf("") }
+        var quantityCap by remember { mutableStateOf("") }
+        var pointsCap by remember { mutableStateOf("") }
+        val parsedRate = newRate.toLongOrNull()
+        val quantityLimit = quantityCap.toLongOrNull()
+        val pointsLimit = pointsCap.toLongOrNull()
+        val valid = title.isNotBlank() && title.length <= 40 && unit.isNotBlank() && unit.length <= 24 &&
+            (parsedRate ?: 0L) > 0 && (quantityCap.isBlank() || (quantityLimit ?: 0L) > 0) &&
+            (pointsCap.isBlank() || (pointsLimit ?: 0L) > 0)
+        AlertDialog(onDismissRequest = { addingActivity = false }, title = { Text("Add an activity") },
+            text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(title, { title = it.take(40) }, label = { Text("Activity name") }, singleLine = true)
+                OutlinedTextField(emoji, { emoji = it }, label = { Text("Emoji") }, singleLine = true)
+                OutlinedTextField(unit, { unit = it.take(24) }, label = { Text("Count each one as (for example, page)") }, singleLine = true)
+                OutlinedTextField(newRate, { newRate = it.filter(Char::isDigit) }, label = { Text("Points per unit") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
+                OutlinedTextField(quantityCap, { quantityCap = it.filter(Char::isDigit) }, label = { Text("Daily quantity limit (optional)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
+                OutlinedTextField(pointsCap, { pointsCap = it.filter(Char::isDigit) }, label = { Text("Daily points limit (optional)") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
+            } },
+            confirmButton = { Button(onClick = {
+                onAddActivity(title.trim(), emoji, unit.trim(), parsedRate ?: 0L, quantityLimit, pointsLimit)
+                addingActivity = false
+            }, enabled = valid) { Text("Add activity") } },
+            dismissButton = { TextButton(onClick = { addingActivity = false }) { Text("Cancel") } })
     }
     editKey?.let { key ->
         val activity = activities.firstOrNull { it.activity.key == key }
