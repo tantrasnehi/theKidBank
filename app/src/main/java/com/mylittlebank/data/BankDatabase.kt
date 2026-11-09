@@ -14,6 +14,9 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Transaction
 import kotlinx.coroutines.flow.Flow
+import java.math.BigDecimal
+import java.math.RoundingMode
+import java.time.YearMonth
 import java.util.UUID
 
 @Entity(tableName = "activity_type")
@@ -81,13 +84,15 @@ interface BankDao {
     @Query("SELECT COALESCE(SUM(pointsDelta), 0) FROM ledger_entry WHERE account = :account")
     fun observeBalance(account: String): Flow<Long>
 
-    @Query("SELECT t.id, t.kind, t.description, t.createdAt, COALESCE(SUM(e.pointsDelta), 0) AS pointsDelta FROM ledger_transaction t JOIN ledger_entry e ON e.transactionId = t.id WHERE e.account = 'AVAILABLE' GROUP BY t.id ORDER BY t.createdAt DESC LIMIT 100")
+    @Query("SELECT t.id, t.kind, t.description, t.createdAt, COALESCE(SUM(CASE WHEN e.account = 'AVAILABLE' THEN e.pointsDelta WHEN t.kind = 'INTEREST' AND e.account = 'SAVINGS' THEN e.pointsDelta ELSE 0 END), 0) AS pointsDelta FROM ledger_transaction t JOIN ledger_entry e ON e.transactionId = t.id WHERE e.account = 'AVAILABLE' OR (t.kind = 'INTEREST' AND e.account = 'SAVINGS') GROUP BY t.id HAVING pointsDelta != 0 ORDER BY t.createdAt DESC LIMIT 100")
     fun observePassbook(): Flow<List<PassbookRow>>
 
     @Query("SELECT * FROM activity_type WHERE key = :key") suspend fun activity(key: String): ActivityTypeEntity?
     @Query("SELECT COUNT(*) FROM activity_type WHERE title = :title COLLATE NOCASE") suspend fun activityTitleCount(title: String): Int
     @Query("SELECT * FROM reward_rule WHERE activityKey = :key") suspend fun rule(key: String): RewardRuleEntity?
     @Query("SELECT COALESCE(SUM(pointsDelta), 0) FROM ledger_entry WHERE account = :account") suspend fun balance(account: String): Long
+    @Query("SELECT COALESCE(SUM(e.pointsDelta), 0) FROM ledger_entry e JOIN ledger_transaction t ON t.id = e.transactionId WHERE e.account = :account AND t.createdAt < :before") suspend fun balanceAt(account: String, before: Long): Long
+    @Query("SELECT EXISTS(SELECT 1 FROM ledger_transaction WHERE idempotencyKey = :key)") suspend fun hasTransaction(key: String): Boolean
     @Query("SELECT COALESCE(SUM(pointsDelta), 0) FROM ledger_entry WHERE account = :account AND transactionId IN (SELECT id FROM ledger_transaction WHERE kind = 'REWARD') AND transactionId IN (SELECT transactionId FROM activity_submission WHERE activityKey = :key AND submittedAt >= :start AND submittedAt < :end)") suspend fun dailyReward(account: String, key: String, start: Long, end: Long): Long
     @Query("SELECT COALESCE(SUM(quantity), 0) FROM activity_submission WHERE activityKey = :key AND submittedAt >= :start AND submittedAt < :end") suspend fun dailyQuantity(key: String, start: Long, end: Long): Long
 
@@ -141,6 +146,34 @@ interface BankDao {
         val key = UUID.randomUUID().toString()
         insertActivity(ActivityTypeEntity(key, cleanTitle, emoji.trim().ifBlank { "⭐" }, cleanUnit))
         insertRule(RewardRuleEntity(key, ratePoints, System.currentTimeMillis(), dailyQuantityLimit, dailyPointsLimit))
+    }
+
+    @Transaction
+    suspend fun postMonthlyInterest(month: YearMonth, ratePercent: Int, monthEnd: Long): Long {
+        require(ratePercent in 0..100) { "Monthly interest must be between 0% and 100%." }
+        val period = month.toString()
+        val idempotencyKey = "SAVINGS_INTEREST_$period"
+        if (hasTransaction(idempotencyKey)) return 0L
+
+        val closingBalance = balanceAt("SAVINGS", monthEnd)
+        check(closingBalance >= 0L) { "Savings balance cannot be negative." }
+        val earned = BigDecimal.valueOf(closingBalance)
+            .multiply(BigDecimal.valueOf(ratePercent.toLong()))
+            .divide(BigDecimal.valueOf(100), 0, RoundingMode.HALF_UP)
+            .longValueExact()
+        val id = UUID.randomUUID().toString()
+        insertTransaction(LedgerTransactionEntity(
+            id = id,
+            idempotencyKey = idempotencyKey,
+            kind = "INTEREST",
+            description = "Monthly savings interest",
+            createdAt = monthEnd
+        ))
+        insertEntries(listOf(
+            LedgerEntryEntity(transactionId = id, account = "SAVINGS", pointsDelta = earned),
+            LedgerEntryEntity(transactionId = id, account = "INTEREST_FUND", pointsDelta = Math.negateExact(earned))
+        ))
+        return earned
     }
 
     @Transaction

@@ -3,6 +3,10 @@ package com.mylittlebank
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -15,7 +19,10 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -23,8 +30,6 @@ import androidx.compose.ui.unit.sp
 import androidx.room.withTransaction
 import com.mylittlebank.data.*
 import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.stringPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.map
 import java.text.NumberFormat
@@ -32,19 +37,18 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import kotlin.random.Random
 
 private val Ink = Color(0xFF20334D)
 private val Sky = Color(0xFFE8F5FF)
 private val Mint = Color(0xFFE6F6EE)
 private val Gold = Color(0xFFFFF4D4)
 private val Lilac = Color(0xFFF1EBFF)
-private val android.content.Context.dataStore by preferencesDataStore(name = "profile")
-private val ChildNameKey = stringPreferencesKey("child_name")
-
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val dao = BankDatabase.get(applicationContext).bankDao()
+        MonthlyInterestScheduler.scheduleCurrentMonth(applicationContext)
         setContent { LittleBankApp(dao) }
     }
 }
@@ -63,12 +67,15 @@ private fun LittleBankApp(dao: BankDao) {
     var rows by remember { mutableStateOf<List<PassbookRow>>(emptyList()) }
     var message by remember { mutableStateOf<String?>(null) }
     var showActivity by remember { mutableStateOf<ActivityWithRule?>(null) }
+    var monthlyInterestPercent by remember { mutableIntStateOf(5) }
+    var celebrationToken by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(Unit) {
         dao.initialize()
         dao.observeActivities().collect { activities = it }
     }
-    LaunchedEffect(Unit) { context.dataStore.data.map { it[ChildNameKey] ?: "" }.collect { childName = it } }
+    LaunchedEffect(Unit) { context.profileDataStore.data.map { it[ProfilePreferenceKeys.childName] ?: "" }.collect { childName = it } }
+    LaunchedEffect(Unit) { context.profileDataStore.data.map { it[ProfilePreferenceKeys.monthlySavingsInterestPercent] ?: 5 }.collect { monthlyInterestPercent = it } }
     LaunchedEffect(Unit) { dao.observeBalance("AVAILABLE").collect { available = it } }
     LaunchedEffect(Unit) { dao.observeBalance("SAVINGS").collect { savings = it } }
     LaunchedEffect(Unit) { dao.observePassbook().collect { rows = it } }
@@ -80,7 +87,7 @@ private fun LittleBankApp(dao: BankDao) {
         if (childName.isBlank()) {
             WelcomeScreen(nameInput, { nameInput = it }) {
                 childName = nameInput.trim()
-                scope.launch { context.dataStore.edit { it[ChildNameKey] = childName } }
+                scope.launch { context.profileDataStore.edit { it[ProfilePreferenceKeys.childName] = childName } }
             }
         } else {
             BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -121,7 +128,7 @@ private fun LittleBankApp(dao: BankDao) {
                         "Home" -> HomeScreen(childName, available, savings, rows, onGo = { selected = it })
                         "Earn" -> EarnScreen(activities.filter { it.activity.enabled }) { showActivity = it }
                         "My Bank" -> BankScreen(available, savings, rows)
-                        "Savings" -> SavingsScreen(savings, available, onTransfer = { amount, save ->
+                        "Savings" -> SavingsScreen(savings, available, monthlyInterestPercent, onTransfer = { amount, save ->
                             scope.launch {
                                 runCatching { dao.transfer(amount, save, System.currentTimeMillis(), UUID.randomUUID().toString()) }
                                     .onSuccess { message = if (save) "Points moved to savings!" else "Points moved back to your balance." }
@@ -138,8 +145,13 @@ private fun LittleBankApp(dao: BankDao) {
                         }, onToggle = { key, enabled -> scope.launch { dao.setActivityEnabled(key, enabled) } }, onRate = { key, points, quantityLimit, pointsLimit ->
                             scope.launch { dao.putRule(RewardRuleEntity(key, points, System.currentTimeMillis(), quantityLimit, pointsLimit)) }
                         }, onName = { newName ->
-                            childName = newName.trim(); scope.launch { context.dataStore.edit { it[ChildNameKey] = childName } }
-                        }, currentName = childName)
+                            childName = newName.trim(); scope.launch { context.profileDataStore.edit { it[ProfilePreferenceKeys.childName] = childName } }
+                        }, onInterestRate = { newRate ->
+                            scope.launch {
+                                context.profileDataStore.edit { it[ProfilePreferenceKeys.monthlySavingsInterestPercent] = newRate }
+                                message = "Monthly savings interest set to $newRate%."
+                            }
+                        }, monthlyInterestPercent = monthlyInterestPercent, currentName = childName)
                     }
                     }
                 }
@@ -151,7 +163,7 @@ private fun LittleBankApp(dao: BankDao) {
                 val activity = showActivity!!
                 scope.launch {
                     runCatching { dao.postReward(activity.activity.key, quantity, note, UUID.randomUUID().toString(), System.currentTimeMillis()) }
-                        .onSuccess { message = "You earned ${formatPoints(it)} points! Great job!" }
+                        .onSuccess { message = "You earned ${formatPoints(it)} points! Great job!"; celebrationToken++ }
                         .onFailure { message = it.message ?: "Please try again." }
                     showActivity = null
                 }
@@ -160,6 +172,7 @@ private fun LittleBankApp(dao: BankDao) {
         message?.let { text ->
             AlertDialog(onDismissRequest = { message = null }, confirmButton = { TextButton(onClick = { message = null }) { Text("Yay!") } }, text = { Text(text) })
         }
+        ConfettiCelebration(celebrationToken)
     }
 }
 
@@ -270,7 +283,7 @@ private fun BankScreen(available: Long, savings: Long, rows: List<PassbookRow>) 
 private fun TransactionLine(row: PassbookRow) {
     Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
         Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(if (row.kind == "REWARD") "⭐" else "🐷", fontSize = 24.sp)
+            Text(when (row.kind) { "REWARD" -> "⭐"; "INTEREST" -> "✨"; else -> "🐷" }, fontSize = 24.sp)
             Column(Modifier.weight(1f).padding(start = 12.dp)) {
                 Text(row.description, color = Ink, fontWeight = FontWeight.SemiBold)
                 Text(SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()).format(Date(row.createdAt)), fontSize = 12.sp, color = Ink.copy(alpha = .65f))
@@ -282,11 +295,21 @@ private fun TransactionLine(row: PassbookRow) {
 }
 
 @Composable
-private fun SavingsScreen(savings: Long, available: Long, onTransfer: (Long, Boolean) -> Unit) {
+private fun SavingsScreen(savings: Long, available: Long, monthlyInterestPercent: Int, onTransfer: (Long, Boolean) -> Unit) {
     var amount by remember { mutableStateOf("") }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { Text("My Savings 🐷", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Ink) }
         item { Text("A little saved today can help with a big dream tomorrow.", color = Ink) }
+        item {
+            Card(shape = RoundedCornerShape(18.dp), colors = CardDefaults.cardColors(containerColor = Sky)) {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("What are savings?", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Ink)
+                    Text("Savings are points you set aside for later. They stay yours, and you can move them back whenever you need.", color = Ink)
+                    Text("At the end of each month, the bank adds $monthlyInterestPercent% extra points to your savings. Those extra points are called interest.", color = Ink)
+                    Text("For example, 100 points saved at month-end earns $monthlyInterestPercent extra points at this rate.", fontSize = 13.sp, color = Ink.copy(alpha = .75f))
+                }
+            }
+        }
         item { BalanceCard("Saved points", savings, "🌱", Mint, Modifier.fillMaxWidth()) {} }
         item { OutlinedTextField(amount, { amount = it.filter(Char::isDigit) }, label = { Text("Points to move") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true) }
         item { Button(onClick = { amount.toLongOrNull()?.let { onTransfer(it, true) } }, enabled = (amount.toLongOrNull() ?: 0) > 0 && available >= (amount.toLongOrNull() ?: Long.MAX_VALUE), modifier = Modifier.heightIn(min = 52.dp)) { Text("Put points into savings") } }
@@ -312,16 +335,39 @@ private fun ParentScreen(
     onToggle: (String, Boolean) -> Unit,
     onRate: (String, Long, Long?, Long?) -> Unit,
     onName: (String) -> Unit,
+    onInterestRate: (Int) -> Unit,
+    monthlyInterestPercent: Int,
     currentName: String
 ) {
     var name by remember(currentName) { mutableStateOf(currentName) }
     var editKey by remember { mutableStateOf<String?>(null) }
     var rate by remember { mutableStateOf("") }
     var addingActivity by remember { mutableStateOf(false) }
+    var interestRateText by remember(monthlyInterestPercent) { mutableStateOf(monthlyInterestPercent.toString()) }
+    val parsedInterestRate = interestRateText.toIntOrNull()
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { Text("Grown-up corner", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Ink) }
         item { Text("Choose activities and set their rewards. Changes apply to future activities.", color = Ink) }
         item { OutlinedTextField(name, { name = it }, label = { Text("Child's name") }, trailingIcon = { TextButton(onClick = { if (name.isNotBlank()) onName(name) }) { Text("Save") } }, singleLine = true) }
+        item {
+            Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Mint)) {
+                Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Savings interest", fontWeight = FontWeight.Bold, color = Ink)
+                    Text("Choose the monthly rate. Interest is added to savings once at month-end.", color = Ink)
+                    OutlinedTextField(
+                        interestRateText,
+                        { interestRateText = it.filter(Char::isDigit).take(3) },
+                        label = { Text("Percent per month (0–100)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true
+                    )
+                    Button(
+                        onClick = { parsedInterestRate?.let(onInterestRate) },
+                        enabled = parsedInterestRate != null && parsedInterestRate in 0..100
+                    ) { Text("Save interest rate") }
+                }
+            }
+        }
         item { Button(onClick = { addingActivity = true }, modifier = Modifier.heightIn(min = 48.dp)) { Icon(Icons.Default.Add, contentDescription = null); Spacer(Modifier.width(8.dp)); Text("Add activity") } }
         items(activities) { item ->
             Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(16.dp)) {
@@ -380,6 +426,63 @@ private fun ParentScreen(
                 editKey = null
             }, enabled = rate.toLongOrNull() != null) { Text("Save rate") } },
             dismissButton = { TextButton(onClick = { editKey = null }) { Text("Cancel") } })
+    }
+}
+
+private data class ConfettiPiece(
+    val fromLeft: Boolean,
+    val spread: Float,
+    val delay: Float,
+    val size: Float,
+    val sway: Float,
+    val phase: Float,
+    val rotation: Float,
+    val color: Color
+)
+
+@Composable
+private fun ConfettiCelebration(trigger: Int) {
+    val progress = remember { Animatable(1f) }
+    val colors = remember { listOf(Color(0xFFFFC857), Color(0xFFFF7799), Color(0xFF51B9F2), Color(0xFF53C995), Color(0xFFAA8BF2)) }
+    val pieces = remember {
+        List(64) { index ->
+            ConfettiPiece(
+                fromLeft = index % 2 == 0,
+                spread = Random.nextFloat(),
+                delay = Random.nextFloat() * 0.18f,
+                size = 5f + Random.nextFloat() * 7f,
+                sway = (Random.nextFloat() - 0.5f) * 0.08f,
+                phase = Random.nextFloat() * 6.28f,
+                rotation = (Random.nextFloat() - 0.5f) * 900f,
+                color = colors.random()
+            )
+        }
+    }
+
+    LaunchedEffect(trigger) {
+        if (trigger > 0) {
+            progress.snapTo(0f)
+            progress.animateTo(1f, animationSpec = tween(durationMillis = 2600, easing = LinearEasing))
+        }
+    }
+
+    Canvas(Modifier.fillMaxSize()) {
+        if (trigger == 0 || progress.value >= 1f) return@Canvas
+        pieces.forEachIndexed { index, piece ->
+            val fall = ((progress.value - piece.delay) / (1f - piece.delay)).coerceIn(0f, 1f)
+            val startX = if (piece.fromLeft) -piece.size else size.width + piece.size
+            val endX = if (piece.fromLeft) size.width * (0.22f + piece.spread * 0.34f) else size.width * (0.44f + piece.spread * 0.34f)
+            val sway = kotlin.math.sin((fall * 6.28f + piece.phase).toDouble()).toFloat() * size.width * piece.sway
+            val x = startX + (endX - startX) * fall + sway
+            val y = -piece.size * (1f + piece.spread) + fall * (size.height + piece.size * 3f)
+            if (index % 4 == 0) {
+                drawCircle(piece.color, radius = piece.size * 0.48f, center = Offset(x, y))
+            } else {
+                rotate(piece.rotation * fall, pivot = Offset(x, y)) {
+                    drawRect(piece.color, topLeft = Offset(x - piece.size * 0.4f, y - piece.size * 0.8f), size = Size(piece.size * 0.8f, piece.size * 1.6f))
+                }
+            }
+        }
     }
 }
 
