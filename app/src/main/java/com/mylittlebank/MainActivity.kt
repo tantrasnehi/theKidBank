@@ -67,6 +67,7 @@ private fun LittleBankApp(dao: BankDao) {
     var available by remember { mutableLongStateOf(0L) }
     var savings by remember { mutableLongStateOf(0L) }
     var rows by remember { mutableStateOf<List<PassbookRow>>(emptyList()) }
+    var pendingApprovals by remember { mutableStateOf<List<PendingActivityApproval>>(emptyList()) }
     var message by remember { mutableStateOf<String?>(null) }
     var showActivity by remember { mutableStateOf<ActivityWithRule?>(null) }
     var monthlyInterestPercent by remember { mutableIntStateOf(5) }
@@ -81,6 +82,7 @@ private fun LittleBankApp(dao: BankDao) {
     LaunchedEffect(Unit) { dao.observeBalance("AVAILABLE").collect { available = it } }
     LaunchedEffect(Unit) { dao.observeBalance("SAVINGS").collect { savings = it } }
     LaunchedEffect(Unit) { dao.observePassbook().collect { rows = it } }
+    LaunchedEffect(Unit) { dao.observePendingApprovals().collect { pendingApprovals = it } }
 
     MaterialTheme(colorScheme = lightColorScheme(
         primary = Color(0xFF3478C8), secondary = Color(0xFF48A984), background = Color(0xFFF7FAFC),
@@ -128,7 +130,7 @@ private fun LittleBankApp(dao: BankDao) {
                     Box(Modifier.weight(1f).fillMaxHeight()) {
                     when (selected) {
                         "Home" -> HomeScreen(childName, available, savings, rows, onGo = { selected = it })
-                        "Earn" -> EarnScreen(activities.filter { it.activity.enabled }) { showActivity = it }
+                        "Earn" -> EarnScreen(activities.filter { it.activity.enabled }, pendingApprovals) { showActivity = it }
                         "My Bank" -> BankScreen(available, savings, rows)
                         "Savings" -> SavingsScreen(savings, available, monthlyInterestPercent, onTransfer = { amount, save ->
                             scope.launch {
@@ -138,7 +140,19 @@ private fun LittleBankApp(dao: BankDao) {
                             }
                         })
                         "Learn" -> LearnScreen()
-                        else -> ParentScreen(activities, onAddActivity = { title, emoji, unit, points, quantityLimit, pointsLimit ->
+                        else -> ParentScreen(activities, pendingApprovals, onApprove = { id ->
+                            scope.launch {
+                                runCatching { dao.approveActivity(id, System.currentTimeMillis()) }
+                                    .onSuccess { message = "Approved! ${formatPoints(it)} points were added to the child's balance." }
+                                    .onFailure { message = it.message ?: "This request could not be approved." }
+                            }
+                        }, onReject = { id ->
+                            scope.launch {
+                                runCatching { dao.rejectActivity(id) }
+                                    .onSuccess { message = "Activity request declined." }
+                                    .onFailure { message = it.message ?: "This request could not be declined." }
+                            }
+                        }, onAddActivity = { title, emoji, unit, points, quantityLimit, pointsLimit ->
                             scope.launch {
                                 runCatching { dao.addActivity(title, emoji, unit, points, quantityLimit, pointsLimit) }
                                     .onSuccess { message = "$title was added to activities." }
@@ -174,8 +188,8 @@ private fun LittleBankApp(dao: BankDao) {
             ActivityDialog(showActivity!!, onDismiss = { showActivity = null }, onSubmit = { quantity, note ->
                 val activity = showActivity!!
                 scope.launch {
-                    runCatching { dao.postReward(activity.activity.key, quantity, note, UUID.randomUUID().toString(), System.currentTimeMillis()) }
-                        .onSuccess { message = "You earned ${formatPoints(it)} points! Great job!"; celebrationToken++ }
+                    runCatching { dao.submitRewardForApproval(activity.activity.key, quantity, note, System.currentTimeMillis()) }
+                        .onSuccess { message = "Your activity was sent to your parent for approval!"; celebrationToken++ }
                         .onFailure { message = it.message ?: "Please try again." }
                     showActivity = null
                 }
@@ -245,10 +259,22 @@ private fun QuickAction(title: String, emoji: String, color: Color, modifier: Mo
 }
 
 @Composable
-private fun EarnScreen(activities: List<ActivityWithRule>, onActivity: (ActivityWithRule) -> Unit) {
+private fun EarnScreen(activities: List<ActivityWithRule>, pendingApprovals: List<PendingActivityApproval>, onActivity: (ActivityWithRule) -> Unit) {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { Text("Choose an activity", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Ink) }
         item { Text("Do your best, then tell us what you completed.", color = Ink.copy(alpha = .75f)) }
+        if (pendingApprovals.isNotEmpty()) {
+            item {
+                Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Gold)) {
+                    Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Waiting for parent approval", color = Ink, fontWeight = FontWeight.SemiBold)
+                        pendingApprovals.forEach { request ->
+                            Text("${request.emoji} ${request.activityTitle}: ${request.quantity} ${request.activityUnit} • ${formatPoints(request.rewardPoints)} points", color = Ink.copy(alpha = .82f), fontSize = 14.sp)
+                        }
+                    }
+                }
+            }
+        }
         items(activities) { item ->
             Card(onClick = { onActivity(item) }, shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
                 Row(Modifier.fillMaxWidth().heightIn(min = 82.dp).padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -274,9 +300,9 @@ private fun ActivityDialog(activity: ActivityWithRule, onDismiss: () -> Unit, on
             Text("How many ${activity.activity.unit}s did you finish?")
             OutlinedTextField(quantityText, { quantityText = it.filter(Char::isDigit) }, label = { Text("Quantity") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true)
             OutlinedTextField(note, { note = it }, label = { Text("Add a note (optional)") }, singleLine = true)
-            Text("You'll earn $earned points", fontWeight = FontWeight.Bold, color = Color(0xFF247B56))
+            Text("$earned points will be added after parent approval.", fontWeight = FontWeight.Bold, color = Color(0xFF55A978))
         } },
-        confirmButton = { Button(onClick = { if (!submitting) { submitting = true; onSubmit(quantity, note) } }, enabled = quantity > 0 && !submitting) { Text(if (submitting) "Saving…" else "Submit & Earn") } },
+        confirmButton = { Button(onClick = { if (!submitting) { submitting = true; onSubmit(quantity, note) } }, enabled = quantity > 0 && !submitting) { Text(if (submitting) "Sending…" else "Send for approval") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Not yet") } })
 }
 
@@ -301,7 +327,13 @@ private fun TransactionLine(row: PassbookRow) {
                 Text(SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()).format(Date(row.createdAt)), fontSize = 12.sp, color = Ink.copy(alpha = .65f))
             }
             val sign = if (row.pointsDelta >= 0) "+" else "−"
-            Text("$sign${formatPoints(kotlin.math.abs(row.pointsDelta))}", color = if (row.pointsDelta >= 0) Color(0xFF247B56) else Ink, fontWeight = FontWeight.Bold)
+            val isCredit = row.pointsDelta >= 0
+            Text(
+                "$sign${formatPoints(kotlin.math.abs(row.pointsDelta))}",
+                modifier = Modifier.background(if (isCredit) Color(0xFFE8F5EC) else Color(0xFFFFEFED), RoundedCornerShape(12.dp)).padding(horizontal = 10.dp, vertical = 6.dp),
+                color = if (isCredit) Color(0xFF55A978) else Color(0xFFE47B76),
+                fontWeight = FontWeight.Bold
+            )
         }
     }
 }
@@ -323,6 +355,17 @@ private fun SavingsScreen(savings: Long, available: Long, monthlyInterestPercent
             }
         }
         item { BalanceCard("Saved points", savings, "🌱", Mint, Modifier.fillMaxWidth()) {} }
+        item {
+            Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Sky)) {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Available to save", fontWeight = FontWeight.SemiBold, color = Ink)
+                        Text("${formatPoints(available)} points can be moved into savings", color = Ink.copy(alpha = .78f), fontSize = 14.sp)
+                    }
+                    TextButton(onClick = { amount = available.toString() }, enabled = available > 0) { Text("Use all") }
+                }
+            }
+        }
         item { OutlinedTextField(amount, { amount = it.filter(Char::isDigit) }, label = { Text("Points to move") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true) }
         item { Button(onClick = { amount.toLongOrNull()?.let { onTransfer(it, true) } }, enabled = (amount.toLongOrNull() ?: 0) > 0 && available >= (amount.toLongOrNull() ?: Long.MAX_VALUE), modifier = Modifier.heightIn(min = 52.dp)) { Text("Put points into savings") } }
         item { OutlinedButton(onClick = { amount.toLongOrNull()?.let { onTransfer(it, false) } }, enabled = (amount.toLongOrNull() ?: 0) > 0 && savings >= (amount.toLongOrNull() ?: Long.MAX_VALUE), modifier = Modifier.heightIn(min = 52.dp)) { Text("Move points back") } }
@@ -343,6 +386,9 @@ private fun LearnScreen() {
 @Composable
 private fun ParentScreen(
     activities: List<ActivityWithRule>,
+    pendingApprovals: List<PendingActivityApproval>,
+    onApprove: (String) -> Unit,
+    onReject: (String) -> Unit,
     onAddActivity: (String, String, String, Long, Long?, Long?) -> Unit,
     onToggle: (String, Boolean) -> Unit,
     onEditActivity: (String, String, String, String, Long, Long?, Long?) -> Unit,
@@ -361,6 +407,25 @@ private fun ParentScreen(
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { Text("Grown-up corner", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Ink) }
         item { Text("Choose activities and set their rewards. Changes apply to future activities.", color = Ink) }
+        item { Text("Activity approvals (${pendingApprovals.size})", fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Ink) }
+        if (pendingApprovals.isEmpty()) {
+            item { Text("No activity requests waiting for approval.", color = Ink.copy(alpha = .7f)) }
+        } else {
+            items(pendingApprovals, key = { it.id }) { request ->
+                Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Sky)) {
+                    Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("${request.emoji} ${request.activityTitle}", color = Ink, fontWeight = FontWeight.SemiBold)
+                        Text("${request.quantity} ${request.activityUnit} • ${formatPoints(request.rewardPoints)} points requested", color = Ink)
+                        if (request.note.isNotBlank()) Text(request.note, color = Ink.copy(alpha = .75f))
+                        Text(SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()).format(Date(request.submittedAt)), fontSize = 12.sp, color = Ink.copy(alpha = .65f))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            TextButton(onClick = { onReject(request.id) }) { Text("Decline", color = Color(0xFFE47B76)) }
+                            Button(onClick = { onApprove(request.id) }) { Text("Approve") }
+                        }
+                    }
+                }
+            }
+        }
         item { OutlinedTextField(name, { name = it }, label = { Text("Child's name") }, trailingIcon = { TextButton(onClick = { if (name.isNotBlank()) onName(name) }) { Text("Save") } }, singleLine = true) }
         item {
             Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Mint)) {

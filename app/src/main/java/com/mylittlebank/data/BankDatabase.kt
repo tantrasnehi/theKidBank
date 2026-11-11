@@ -14,6 +14,8 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Transaction
 import androidx.room.Update
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -78,6 +80,19 @@ data class PassbookRow(
     val pointsDelta: Long
 )
 
+@Entity(tableName = "pending_activity_approval", indices = [Index("submittedAt")])
+data class PendingActivityApproval(
+    @PrimaryKey val id: String = UUID.randomUUID().toString(),
+    val activityKey: String,
+    val activityTitle: String,
+    val activityUnit: String,
+    val emoji: String,
+    val quantity: Long,
+    val note: String,
+    val rewardPoints: Long,
+    val submittedAt: Long
+)
+
 @Dao
 interface BankDao {
     @Query("SELECT a.*, r.ratePoints, r.dailyQuantityLimit, r.dailyPointsLimit FROM activity_type a JOIN reward_rule r ON r.activityKey = a.key ORDER BY a.rowid")
@@ -91,6 +106,8 @@ interface BankDao {
     fun observePassbook(): Flow<List<PassbookRow>>
 
     @Query("SELECT * FROM activity_type WHERE key = :key") suspend fun activity(key: String): ActivityTypeEntity?
+    @Query("SELECT * FROM pending_activity_approval ORDER BY submittedAt") fun observePendingApprovals(): Flow<List<PendingActivityApproval>>
+    @Query("SELECT * FROM pending_activity_approval WHERE id = :id") suspend fun pendingApproval(id: String): PendingActivityApproval?
     @Query("SELECT COUNT(*) FROM activity_type WHERE title = :title COLLATE NOCASE") suspend fun activityTitleCount(title: String): Int
     @Query("SELECT COUNT(*) FROM activity_type WHERE title = :title COLLATE NOCASE AND key != :key") suspend fun activityTitleCountExcept(title: String, key: String): Int
     @Query("SELECT * FROM reward_rule WHERE activityKey = :key") suspend fun rule(key: String): RewardRuleEntity?
@@ -99,14 +116,18 @@ interface BankDao {
     @Query("SELECT EXISTS(SELECT 1 FROM ledger_transaction WHERE idempotencyKey = :key)") suspend fun hasTransaction(key: String): Boolean
     @Query("SELECT COALESCE(SUM(pointsDelta), 0) FROM ledger_entry WHERE account = :account AND transactionId IN (SELECT id FROM ledger_transaction WHERE kind = 'REWARD') AND transactionId IN (SELECT transactionId FROM activity_submission WHERE activityKey = :key AND submittedAt >= :start AND submittedAt < :end)") suspend fun dailyReward(account: String, key: String, start: Long, end: Long): Long
     @Query("SELECT COALESCE(SUM(quantity), 0) FROM activity_submission WHERE activityKey = :key AND submittedAt >= :start AND submittedAt < :end") suspend fun dailyQuantity(key: String, start: Long, end: Long): Long
+    @Query("SELECT COALESCE(SUM(quantity), 0) FROM pending_activity_approval WHERE activityKey = :key AND submittedAt >= :start AND submittedAt < :end") suspend fun dailyPendingQuantity(key: String, start: Long, end: Long): Long
+    @Query("SELECT COALESCE(SUM(rewardPoints), 0) FROM pending_activity_approval WHERE activityKey = :key AND submittedAt >= :start AND submittedAt < :end") suspend fun dailyPendingReward(key: String, start: Long, end: Long): Long
 
     @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertTransaction(entity: LedgerTransactionEntity)
     @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertEntries(entities: List<LedgerEntryEntity>)
     @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertSubmission(entity: ActivitySubmissionEntity)
+    @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertPendingApproval(entity: PendingActivityApproval)
     @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertActivity(entity: ActivityTypeEntity)
     @Insert(onConflict = OnConflictStrategy.ABORT) suspend fun insertRule(entity: RewardRuleEntity)
     @Update suspend fun updateActivityRow(entity: ActivityTypeEntity): Int
     @Query("DELETE FROM activity_type WHERE key = :key") suspend fun deleteActivityRow(key: String): Int
+    @Query("DELETE FROM pending_activity_approval WHERE id = :id") suspend fun deletePendingApproval(id: String): Int
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun putRule(rule: RewardRuleEntity)
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun seedActivities(items: List<ActivityTypeEntity>)
     @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun seedRules(items: List<RewardRuleEntity>)
@@ -221,7 +242,7 @@ interface BankDao {
     }
 
     @Transaction
-    suspend fun postReward(activityKey: String, quantity: Long, note: String, idempotencyKey: String, now: Long): Long {
+    suspend fun submitRewardForApproval(activityKey: String, quantity: Long, note: String, now: Long): Long {
         require(quantity > 0) { "Enter a quantity greater than zero." }
         val activity = activity(activityKey) ?: error("This activity is unavailable.")
         val rule = rule(activityKey) ?: error("A reward has not been set for this activity.")
@@ -232,21 +253,50 @@ interface BankDao {
         val start = day.atStartOfDay(zone).toInstant().toEpochMilli()
         val end = day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
         rule.dailyQuantityLimit?.let { cap ->
-            check(Math.addExact(dailyQuantity(activityKey, start, end), quantity) <= cap) { "Today's activity limit has been reached. Try again tomorrow!" }
+            val used = Math.addExact(dailyQuantity(activityKey, start, end), dailyPendingQuantity(activityKey, start, end))
+            check(Math.addExact(used, quantity) <= cap) { "Today's activity limit has been reached. Try again tomorrow!" }
         }
         rule.dailyPointsLimit?.let { cap ->
-            check(Math.addExact(dailyReward("AVAILABLE", activityKey, start, end), earned) <= cap) { "Today's points limit has been reached. Try again tomorrow!" }
+            val used = Math.addExact(dailyReward("AVAILABLE", activityKey, start, end), dailyPendingReward(activityKey, start, end))
+            check(Math.addExact(used, earned) <= cap) { "Today's points limit has been reached. Try again tomorrow!" }
         }
-        val id = UUID.randomUUID().toString()
-        val transaction = LedgerTransactionEntity(id = id, idempotencyKey = idempotencyKey, kind = "REWARD", description = note.ifBlank { activity.title }, createdAt = now)
-        insertTransaction(transaction)
-        insertEntries(listOf(
-            LedgerEntryEntity(transactionId = id, account = "AVAILABLE", pointsDelta = earned),
-            LedgerEntryEntity(transactionId = id, account = "REWARD_FUND", pointsDelta = Math.negateExact(earned))
+        insertPendingApproval(PendingActivityApproval(
+            activityKey = activityKey,
+            activityTitle = activity.title,
+            activityUnit = activity.unit,
+            emoji = activity.emoji,
+            quantity = quantity,
+            note = note.trim(),
+            rewardPoints = earned,
+            submittedAt = now
         ))
-        insertSubmission(ActivitySubmissionEntity(idempotencyKey = idempotencyKey, activityKey = activityKey, quantity = quantity, submittedAt = now, transactionId = id))
-        check(earned + Math.negateExact(earned) == 0L)
         return earned
+    }
+
+    @Transaction
+    suspend fun approveActivity(id: String, now: Long): Long {
+        val pending = pendingApproval(id) ?: error("This request has already been handled.")
+        val transactionId = UUID.randomUUID().toString()
+        val approvalKey = "APPROVED_ACTIVITY_$id"
+        insertTransaction(LedgerTransactionEntity(
+            id = transactionId,
+            idempotencyKey = approvalKey,
+            kind = "REWARD",
+            description = pending.note.ifBlank { pending.activityTitle },
+            createdAt = now
+        ))
+        insertEntries(listOf(
+            LedgerEntryEntity(transactionId = transactionId, account = "AVAILABLE", pointsDelta = pending.rewardPoints),
+            LedgerEntryEntity(transactionId = transactionId, account = "REWARD_FUND", pointsDelta = Math.negateExact(pending.rewardPoints))
+        ))
+        insertSubmission(ActivitySubmissionEntity(idempotencyKey = approvalKey, activityKey = pending.activityKey, quantity = pending.quantity, submittedAt = pending.submittedAt, transactionId = transactionId))
+        check(deletePendingApproval(id) == 1) { "This request has already been handled." }
+        return pending.rewardPoints
+    }
+
+    @Transaction
+    suspend fun rejectActivity(id: String) {
+        check(deletePendingApproval(id) == 1) { "This request has already been handled." }
     }
 
     @Transaction
@@ -271,14 +321,22 @@ data class ActivitySubmissionEntity(
     val transactionId: String
 )
 
-@Database(entities = [ActivityTypeEntity::class, RewardRuleEntity::class, LedgerTransactionEntity::class, LedgerEntryEntity::class, ActivitySubmissionEntity::class], version = 1, exportSchema = true)
+@Database(entities = [ActivityTypeEntity::class, RewardRuleEntity::class, LedgerTransactionEntity::class, LedgerEntryEntity::class, ActivitySubmissionEntity::class, PendingActivityApproval::class], version = 2, exportSchema = true)
 abstract class BankDatabase : RoomDatabase() {
     abstract fun bankDao(): BankDao
 
     companion object {
+        private val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS `pending_activity_approval` (`id` TEXT NOT NULL, `activityKey` TEXT NOT NULL, `activityTitle` TEXT NOT NULL, `activityUnit` TEXT NOT NULL, `emoji` TEXT NOT NULL, `quantity` INTEGER NOT NULL, `note` TEXT NOT NULL, `rewardPoints` INTEGER NOT NULL, `submittedAt` INTEGER NOT NULL, PRIMARY KEY(`id`))")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_pending_activity_approval_submittedAt` ON `pending_activity_approval` (`submittedAt`)")
+            }
+        }
         @Volatile private var instance: BankDatabase? = null
         fun get(context: Context): BankDatabase = instance ?: synchronized(this) {
-            instance ?: Room.databaseBuilder(context, BankDatabase::class.java, "my_little_bank.db").build().also { instance = it }
+            instance ?: Room.databaseBuilder(context, BankDatabase::class.java, "my_little_bank.db")
+                .addMigrations(MIGRATION_1_2)
+                .build().also { instance = it }
         }
     }
 }
